@@ -31,6 +31,19 @@
     crowbars, and blowtorches. Maybe shoulda writa a parser?
  
     version 1.0 - LociOiling - 20201208
+    version 1.1 - LociOiling - 202012xx
+        + added LuaV1 and LuaV2 options to allow dumping Lua recipes
+        + added noGUI option to allow skipping GUI recipes
+        + added outdir option to allow specifying where Lua files go
+        + added new SelectBands and SelectSegment for user picks
+        + correct LWS user picks "by stride"
+        + correct LWS missing iterations 
+        + correct LWS segment selection logic for user picks
+        + handle old GUI example recipes with missing attributes
+        + handle multiline comments in GUI recipes
+        + handle missing number of iterations for GUI example 1
+        + streamline some of the common error conditions
+        + handle single.macro format
 '''
 
 import argparse
@@ -82,6 +95,48 @@ def JSONize ( spirit ):
     rxx = json.loads ( rout )
     return rxx
 
+def ListLua ( rxx, outdir ):
+#
+#   process entire recipe
+#
+    def get_valid_filename(s):  # borrowed from Django
+        s = str(s).strip().replace(' ', '_')
+        return re.sub(r'(?u)[^-\w.]', '', s)
+    rxxfile = get_valid_filename ( rxx [ "name" ] ) + ".lua" 
+    with open ( os.path.join ( outdir, rxxfile ), "w" ) as fout:
+    #
+    #   print the recipe attributes as a Lua block comment
+    #   (slightly different list than the one for a GUI recipe)
+    #
+        rxattrs = [
+             "name",
+             "desc",
+             "type",
+             "folder_name", 
+             "hidden",
+             "mid",
+             "mrid",
+             "parent",
+             "parent_mrid",
+             "player_id",
+             "share_scope",
+             "uses",
+             "script_version",
+             "ver"
+             ]
+        fout.write ( "--[[\n\n" )
+        for attr in rxattrs:
+            fout.write ( "    {} = {}\n".format ( attr, rxx [ attr ] ) )
+        fout.write ( "\n]]--\n" )
+        #for thing in rxx:
+        #    print ( thing )
+        try:    
+            line = rxx [ "script" ]
+            fout.write ( "{}\n".format ( line ) )
+        except:
+            pass
+    return
+
 #
 #   ListCmds - list the commands in a GUI recipe
 #
@@ -89,83 +144,143 @@ def JSONize ( spirit ):
 #   
 #   rxx    - JSON object containing recipe
 #   detail - include dump of GUI values as comments if true
+#   outdir - output directory
 #
 #   note: lots of helper functions first - 
 #         the action starts far down below,
 #         just before "def main" 
 #
-def ListCmds ( rxx, detail ):
+def ListCmds ( rxx, detail, outdir ):
 #   
 #   railroad methods on full display in these generator routines
 #
-    def genShake ( args, fout ):
-        val = args [ "num_of_iterations" ] [ "val" ]
+    def doSegPick ( ref ):
+        refi = int ( ref ) 
+
+    #
+    #   segref is the Lua table containing a list of segments
+    #
+        segref = "segList_"
+        segref = segref + ref
+
+    #   
+    #   if the referenced user pick doesn't exist, create it
+    #   using dialog.SelectSegments
+    #
+        if refi > len ( segpick ):
+            segpick.append ( segref )
+            fout.write ( "    {} = dialog.SelectSegments ()\n".format ( segref ) )
+        return segref
+
+    def doBndPick ( ref ):
+        refi = int ( ref ) 
+
+    #
+    #   bndref is the Lua table containing a list of segments
+    #
+        bndref = "bndList_"
+        bndref = bndref + ref
+
+    #   
+    #   if the referenced user pick doesn't exist, create it
+    #   using dialog.SelectBands
+    #
+        if refi > len ( bndpick ):
+            bndpick.append ( bndref )
+            fout.write ( "    {} = dialog.SelectBands ()\n".format ( bndref ) )
+        return bndref
+
+    def safeVal ( rxx, top, key, missing ):
+    #
+    #   handle a missing ingredient -- 
+    #   mainly to allow processing old 
+    #   GUI example recipes
+    #
+        val = missing
+        try:
+            val = rxx [ top ] [ key ]
+        except:
+            pass
+        return val
+
+    def safeIters ( rxx ):
+        val = safeVal ( rxx, "num_of_iterations", "val", "-1" ) 
         if val == "-1":
             fout.write ( "--  TODO: set missing iterations\n" )
         if val == "0":
             fout.write ( "--  TODO: set iterations for \"until stopped\"\n" )
+        return val
+    
+    def safeStart ( rxx, resnam ):
+        start = safeVal ( rxx, resnam, "startval", "-1" ) 
+        if start == "-1":
+            fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
+            fout.write ( "--  TODO: incomplete {} ingredient\n".format ( resnam ) )
+        return start
+    def safeIncr ( rxx, resnam ):
+        incr = safeVal ( rxx, resnam, "stepval", "-1" ) 
+        if incr == "-1":
+            fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+            fout.write ( "--  TODO: incomplete {} ingredient\n".format ( resnam ) )
+        return incr
+
+    def missingRes ( funcname, value ):
+        fout.write ( "--  TODO: undefined residues ingredient\n" )
+        sval = str ( value )
+        if len ( sval ) > 0:
+            fout.write ( "--  TODO: select segments for {} ( {} )\n".format ( funcname, sval ) )
+        else:
+            fout.write ( "--  TODO: select segments for {} ()\n".format ( funcname ) )
+        return
+
+    def genShake ( args ):
+        val = safeIters ( args )
         fout.write ( "    structure.ShakeSidechainsAll ( {} )\n".format ( val ) )
         return
-    def genWiggle ( args, fout ):
-        val = args [ "num_of_iterations" ] [ "val" ]
-        if val == "-1":
-            fout.write ( "--  TODO: set missing iterations\n" )
-        if val == "0":
-            fout.write ( "--  TODO: set iterations for \"until stopped\"\n" )
+    def genWiggle ( args ):
+        val = safeIters ( args )
         fout.write ( "    structure.WiggleAll ( {} )\n".format ( val ) )        
         return
 
-    def genLocalWiggle ( args, fout ):
+    def genLocalWiggle ( args ):
         def genAll ():
-            val = args [ "num_of_iterations" ] [ "val" ]
-            if val == "-1":
-                fout.write ( "--  TODO: set missing iterations\n" )
-            if val == "0":
-                fout.write ( "--  TODO: set iterations for \"until stopped\"\n" )
+            val = safeIters ( args )
             fout.write ( "    structure.LocalWiggleAll ( {} )\n".format ( val ) )
             return
         def genByStride ():
-            val = args [ "num_of_iterations" ] [ "val" ]
-            if val == "-1":
-                fout.write ( "--  TODO: set missing iterations\n" )
-            if val == "0":
-                fout.write ( "--  TODO: set iterations for \"until stopped\"\n" )
+            val = safeIters ( args )
             if args [ "residues" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
-                fout.write ( "    selection.DeselectAll ()\n" )
+                start = safeStart ( args, "residues" )
+                incr = safeIncr ( args, "residues" )
                 fout.write ( "    for seg = {}, structure.GetCount (), {} do\n".format ( start, incr ) )
+                fout.write ( "        selection.DeselectAll ()\n" )
+                fout.write ( "    --  TODO: use selection.SelectRange to local wiggle multiple segments\n" )
                 fout.write ( "        selection.Select ( seg )\n" )
+                fout.write ( "        structure.LocalWiggleSelected ( {} )\n".format ( val ) )
                 fout.write ( "    end\n" )
-                fout.write ( "    structure.LocalWiggleSelected ( {} )\n".format ( val ) )
             if args [ "residues" ] [ "startnam" ] == "residues_ref":
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                segref = "segList_{}".format ( args [ "num_of_iterations" ] [ "startval" ] )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
-                fout.write ( "    selection.DeselectAll ()\n" )
+                segref = doSegPick (  args [ "residues" ] [ "startval" ] )
                 fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
-                fout.write ( "        selection.Select ( seg )\n" )
+                fout.write ( "        selection.DeselectAll ()\n" )
+                fout.write ( "    --  TODO: use selection.SelectRange to local wiggle multiple segments\n" )
+                fout.write ( "        selection.Select ( {} [ seg ] )\n".format ( segref ) )
+                fout.write ( "        structure.LocalWiggleSelected ( {} )\n".format ( val ) )
                 fout.write ( "    end\n" )
-                fout.write ( "    structure.LocalWiggleSelected ( {} )\n".format ( val ) )
             return
         def genReference ():
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref = "segList_{}".format ( args [ "residues" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+            val = safeIters ( args )
+            segref = doSegPick (  args [ "residues" ] [ "ref" ] )
             fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
-            fout.write ( "        structure.LocalWiggle ( {} [ seg ], true, true )\n".format ( segref ) ) 
+            fout.write ( "        selection.DeselectAll ()\n" )
+            fout.write ( "    --  TODO: use selection.SelectRange to local wiggle multiple segments\n" )
+            fout.write ( "        selection.Select ( {} [ seg ] )\n".format ( segref ) )
+            fout.write ( "        structure.LocalWiggleSelected ( {},  true, true )\n".format ( val ) ) 
             fout.write ( "    end\n" )
             return
         def genUndefined ():
-            fout.write ( "--  TODO: undefined residues ingredient\n" )
-            fout.write ( "--  TODO: select segments for structure.LocalWiggleSelected\n" )
-            fout.write ( "    structure.LocalWiggleSelected ()\n" )
+            val = safeIters ( args )
+            missingRes ( "structure.LocalWiggleSelected", val )
+            fout.write ( "    structure.LocalWiggleSelected ( {} )\n".format ( val ) )
             return
         restyps = {
             "residues_all":         genAll,
@@ -177,42 +292,31 @@ def ListCmds ( rxx, detail ):
         restyps [ typ ] ()
         return
 
-    def genFreeze ( args, fout ):
+    def genFreeze ( args ):
         def genAll ():
             fout.write ( "    freeze.FreezeAll ()\n" )
             return
         def genByStride ():
             if args [ "residues" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                start = safeStart ( args, "residues" )
+                incr = safeIncr ( args, "residues" )
                 fout.write ( "    for seg = {}, structure.GetCount (), {} do\n".format ( start, incr ) )
                 fout.write ( "        freeze.Freeze ( seg, true, true )\n" )
                 fout.write ( "    end\n" )
             if args [ "residues" ] [ "startnam" ] == "residues_ref":
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                segref = "segList_{}".format ( args [ "residues" ] [ "startval" ] )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+                segref = doSegPick (  args [ "residues" ] [ "startval" ] )
                 fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
                 fout.write ( "        freeze.Freeze ( {} [ seg ], true, true )\n".format ( segref ) ) 
                 fout.write ( "    end\n" )
             return
         def genReference ():
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref = "segList_{}".format ( args [ "residues" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+            segref = doSegPick (  args [ "residues" ] [ "ref" ] )
             fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
             fout.write ( "        freeze.Freeze ( {} [ seg ], true, true )\n".format ( segref ) ) 
             fout.write ( "    end\n" )
             return
         def genUndefined ():
-            fout.write ( "--  TODO: undefined residues ingredient\n" )
-            fout.write ( "--  TODO: select segment to freeze\n" )
+            missingRes ( "freeze.Freeze", "" )
             fout.write ( "    freeze.Freeze ()\n" )
             return
         restyps = {
@@ -225,42 +329,31 @@ def ListCmds ( rxx, detail ):
         restyps [ typ ] ()
         return
 
-    def genUnfreeze ( args, fout ):
+    def genUnfreeze ( args ):
         def genAll ():
             fout.write ( "    freeze.UnfreezeAll ()\n" )
             return
         def genByStride ():
             if args [ "residues" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: step for \"by stride\" not specified\n" )
+                start = safeStart ( args, "residues" )
+                incr = safeIncr ( args, "residues" )
                 fout.write ( "    for seg = {}, structure.GetCount (), {} do\n".format ( start, incr ) )
                 fout.write ( "        freeze.Unfreeze ( seg, true, true )\n" )
                 fout.write ( "    end\n" )
             if args [ "residues" ] [ "startnam" ] == "residues_ref":
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                segref = "segList_{}".format ( args [ "residues" ] [ "startval" ] )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+                segref = doSegPick (  args [ "residues" ] [ "startval" ] )
                 fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
                 fout.write ( "        freeze.Unfreeze ( {} [ seg ], true, true )\n".format ( segref ) ) 
                 fout.write ( "    end\n" )
             return
         def genReference ():
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref = "segList_{}".format ( args [ "residues" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as list of segments\n".format ( segref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+            segref = doSegPick (  args [ "residues" ] [ "ref" ] )
             fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
             fout.write ( "        freeze.Unfreeze ( {} [ seg ], true, true )\n".format ( segref ) ) 
             fout.write ( "    end\n" )
             return
         def genUndefined ():
-            fout.write ( "--  TODO: undefined residues ingredient\n" )
-            fout.write ( "--  TODO: select segments for freeze.Unfreeze\n" )
+            missingRes ( "freeze.Unfreeze", "" )
             fout.write ( "    freeze.Unfreeze ()\n" )
             return        
         restyps = {
@@ -272,7 +365,7 @@ def ListCmds ( rxx, detail ):
         typ = args [ "residues" ] [ "name" ] 
         restyps [ typ ] ()
         return
-    def genSetSS ( args, fout ):
+    def genSetSS ( args ):
         sscodes = ( "H", "L", "E" )
         def decodeSS ():
             ss = args [ "structure" ] [ "val" ]
@@ -290,12 +383,8 @@ def ListCmds ( rxx, detail ):
         def genByStride ():
             ss = decodeSS ()
             if args [ "residues" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                start = safeStart ( args, "residues" )
+                incr = safeIncr ( args, "residues" )
                 fout.write ( "    selection.DeselectAll ()\n" )
                 fout.write ( "    for seg = {}, structure.GetCount (), {} do\n".format ( start, incr ) ) 
                 fout.write ( "       selection.Select ( seg )\n")
@@ -303,10 +392,7 @@ def ListCmds ( rxx, detail ):
                 fout.write ( "    structure.SetSecondaryStructureSelected ( \"{}\" )\n".format ( ss ) )
                 fout.write ( "    selection.DeselectAll ()\n" )
             if args [ "residues" ] [ "startnam" ] == "residues_ref":
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                segref = "segList_{}".format ( args [ "residues" ] [ "startval" ] )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+                segref = doSegPick (  args [ "residues" ] [ "startval" ] )
                 fout.write ( "    selection.DeselectAll ()\n" )
                 fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
                 fout.write ( "        selection.Select ( {} [ seg ] )\n".format ( segref ) ) 
@@ -316,10 +402,7 @@ def ListCmds ( rxx, detail ):
             return
         def genReference ():
             ss = decodeSS ()
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref = "segList_{}".format ( args [ "residues" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+            segref = doSegPick (  args [ "residues" ] [ "ref" ] )
             fout.write ( "    selection.DeselectAll ()\n" )
             fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
             fout.write ( "        selection.Select ( {} [ seg ]  )\n".format ( segref ) ) 
@@ -329,9 +412,8 @@ def ListCmds ( rxx, detail ):
             return
         def genUndefined ():
             ss = decodeSS ()
-            fout.write ( "--  TODO: undefined residues ingredient\n" )
-            fout.write ( "--  TODO: select segments for structure.SegSecondaryStructureSelected ( \"{}\" )\n" .format ( ss ) ) 
-            fout.write ( "    structure.SetSecondaryStructureSelected ()\n" )
+            missingRes ( "structure.SetSecondaryStructureSelected", ss )
+            fout.write ( "    structure.SetSecondaryStructureSelected ( \"{}\" )\n".format ( ss ) )
             return
         restyps = {
             "residues_all":         genAll,
@@ -342,7 +424,7 @@ def ListCmds ( rxx, detail ):
         typ = args [ "residues" ] [ "name" ] 
         restyps [ typ ] ()
         return
-    def genSetAA ( args, fout ):
+    def genSetAA ( args ):
         def decodeAA ():
             aa = args [ "aa" ] [ "val" ]
             if aa == "-1":
@@ -357,12 +439,8 @@ def ListCmds ( rxx, detail ):
         def genByStride ():
             aa = decodeAA ()
             if args [ "residues" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                start = safeStart ( args, "residues" )
+                incr = safeIncr ( args, "residues" )
                 fout.write ( "    selection.DeselectAll ()\n" )
                 fout.write ( "    for seg = {}, structure.GetCount (), {} do\n".format ( start, incr ) )
                 fout.write ( "       selection.Select ( seg )\n" )
@@ -370,10 +448,7 @@ def ListCmds ( rxx, detail ):
                 fout.write ( "    structure.SetAminoAcidSelected ( \"{}\" )\n".format ( aa ) )
                 fout.write ( "    selection.DeselectAll ()\n" )
             if args [ "residues" ] [ "startnam" ] == "residues_ref":
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                segref = "segList_{}".format ( args [ "residues" ] [ "startval" ] )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+                segref = doSegPick (  args [ "residues" ] [ "startval" ] )
                 fout.write ( "    selection.DeselectAll ()\n" )
                 fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
                 fout.write ( "        selection.Select ( {} [ seg ] )\n".format ( segref ) ) 
@@ -383,10 +458,7 @@ def ListCmds ( rxx, detail ):
             return
         def genReference ():
             aa = decodeAA ()
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref = "segList_{}".format ( args [ "residues" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+            segref = doSegPick (  args [ "residues" ] [ "ref" ] )
             fout.write ( "    selection.DeselectAll ()\n" )
             fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
             fout.write ( "        selection.Select ( {} [ seg ]  )\n".format ( segref ) ) 
@@ -396,9 +468,8 @@ def ListCmds ( rxx, detail ):
             return
         def genUndefined ():
             aa = decodeAA ()
-            fout.write ( "--  TODO: undefined residues ingredient\n" )
-            fout.write ( "--  TODO: select segments for structure.SetAminoAcidSelected ( \"{}\" )\n" .format ( aa ) ) 
-            fout.write ( "    structure.SetAminoAcidSelected ()\n" )
+            missingRes ( "structure.SetAminoAcidSelected", aa )
+            fout.write ( "    structure.SetAminoAcidSelected ( \"{}\" )\n".format ( aa ) )
             return
         restyps = {
             "residues_all":         genAll,
@@ -409,28 +480,16 @@ def ListCmds ( rxx, detail ):
         typ = args [ "residues" ] [ "name" ] 
         restyps [ typ ] ()
         return
-    def genMutate ( args, fout ):
+    def genMutate ( args ):
         def genAll ():
-            iters = args [ "num_of_iterations" ] [ "val" ]
-            if iters == "-1":
-                fout.write ( "--  TODO: missing iterations ingredient\n" )
-            if iters == "0":
-                fout.write ( "--  TODO: set iterations for \"until stopped\"\n" )
+            iters = safeIters ( args )
             fout.write ( "    structure.MutateSidechainsAll ( {} )\n".format ( iters ) )
             return
         def genByStride ():
-            iters = args [ "num_of_iterations" ] [ "val" ]
-            if iters == "-1":
-                fout.write ( "--  TODO: missing iterations ingredient\n" )
-            if iters == "0":
-                fout.write ( "--  TODO: set iterations for \"until stopped\"\n" )
+            iters = safeIters ( args )
             if args [ "residues" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                start = safeStart ( args, "residues" )
+                incr = safeIncr ( args, "residues" )
                 fout.write ( "    selection.DeselectAll ()\n" )
                 fout.write ( "    for seg = {}, structure.GetCount (), {} do\n".format ( start, incr ) ) 
                 fout.write ( "       selection.Select ( seg )\n")
@@ -438,10 +497,7 @@ def ListCmds ( rxx, detail ):
                 fout.write ( "    structure.MutateSidechainsSelected  ( \"{}\" )\n".format ( iters ) )
                 fout.write ( "    selection.DeselectAll ()\n" )
             if args [ "residues" ] [ "startnam" ] == "residues_ref":
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                segref = "segList_{}".format ( args [ "residues" ] [ "startval" ] )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+                segref = doSegPick (  args [ "residues" ] [ "startval" ] )
                 fout.write ( "    selection.DeselectAll ()\n" )
                 fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
                 fout.write ( "        selection.Select ( {} [ seg ] )\n".format ( segref ) ) 
@@ -450,15 +506,8 @@ def ListCmds ( rxx, detail ):
                 fout.write ( "    selection.DeselectAll ()\n" )
             return
         def genReference ():
-            iters = args [ "num_of_iterations" ] [ "val" ]
-            if iters == "-1":
-                fout.write ( "--  TODO: missing iterations ingredient\n" )
-            if iters == "0":
-                fout.write ( "--  TODO: set iterations for \"until stopped\"\n" )
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref = "segList_{}".format ( args [ "residues" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+            iters = safeIters ( args )
+            segref = doSegPick (  args [ "residues" ] [ "ref" ] )
             fout.write ( "    selection.DeselectAll ()\n" )
             fout.write ( "    for seg = 1, #{} do\n".format ( segref ) )
             fout.write ( "        selection.Select ( {} [ seg ]  )\n".format ( segref ) ) 
@@ -467,15 +516,9 @@ def ListCmds ( rxx, detail ):
             fout.write ( "    selection.DeselectAll ()\n" )
             return
         def genUndefined ():
-            iters = args [ "num_of_iterations" ] [ "val" ]
-            if iters == "-1":
-                fout.write ( "--  TODO: missing iterations ingredient\n" )
-                fout.write ( "--  TODO: set iterations for structure.MutateSidechainsSelected\n" )
-            if iters == "0":
-                fout.write ( "--  TODO: set iterations for \"until stopped\"\n" )
-            fout.write ( "--  TODO: undefined residues ingredient\n" )
-            fout.write ( "--  TODO: select residues for structure.MutateSidechainsSelected ( {} )\n".format ( iters ) )
-            fout.write ( "    structure.MutateSidechainsSelected ()\n" )
+            iters = safeIters ( args )
+            missingRes ( "structure.MutateSidechainsSelected", iters )
+            fout.write ( "    structure.MutateSidechainsSelected  ( \"{}\" )\n".format ( iters ) )
             return
         restyps = {
             "residues_all":         genAll,
@@ -489,7 +532,7 @@ def ListCmds ( rxx, detail ):
 #  ===================================================================================================================
 #  genAddBands expands to 4 x 4 = 16 routines
 #  ===================================================================================================================
-    def genAddBands ( args, fout ):
+    def genAddBands ( args ):
         def genAllAll ():
             fout.write ( "    for seg1 = 1, structure.GetCount () do\n"  )
             fout.write ( "        for seg2 = seg1  + 1, structure.GetCount () do\n" )
@@ -499,14 +542,8 @@ def ListCmds ( rxx, detail ):
             return
         def genAllByStride ():
             if args [ "residues2" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues2" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: incomplete residues2 ingredient\n" )
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues2" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: incomplete residues2 ingredient\n" )
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                start = safeStart ( args, "residues2" )
+                incr = safeIncr ( args, "residues2" )
                 fout.write ( "    for seg1 = 1, structure.GetCount () do\n"  )
                 fout.write ( "        for seg2 = {}, structure.GetCount (), {} do\n".format ( start, incr ) )
                 fout.write ( "            if seg1 ~= seg2 then\n" )
@@ -515,10 +552,7 @@ def ListCmds ( rxx, detail ):
                 fout.write ( "        end\n" )
                 fout.write ( "    end\n" )
             if args [ "residues2" ] [ "startnam" ] == "residues_ref":
-                segref = "segList_{}".format ( args [ "residues2" ] [ "startval" ] )
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+                segref = doSegPick (  args [ "residues2" ] [ "startval" ] )
                 fout.write ( "    for seg1 = 1, structure.GetCount () do\n"  )
                 fout.write ( "        for segidx2 = 1, #{} do\n".format ( segref ) )
                 fout.write ( "            if seg1 ~= seg2 then\n" )
@@ -528,10 +562,7 @@ def ListCmds ( rxx, detail ):
                 fout.write ( "    end\n" )
             return
         def genAllReference ():
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref = "segList_{}".format ( args [ "residues2" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+            segref = doSegPick (  args [ "residues2" ] [ "ref" ] )
             fout.write ( "    for seg1 = 1, structure.GetCount () do\n"  )
             fout.write ( "        for segidx2 = 1, #{} do\n".format ( segref ) )
             fout.write ( "            if seg1 ~= {} [ segidx2 ] then\n".format ( segref ) )
@@ -549,12 +580,8 @@ def ListCmds ( rxx, detail ):
             return
         def genByStrideAll ():
             if args [ "residues1" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues1" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues1" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                start = safeStart ( args, "residues1" )
+                incr = safeIncr ( args, "residues1" )
                 fout.write ( "    for seg1 = {}, structure.GetCount (), {} do\n".format ( start, incr ) )
                 fout.write ( "        for seg2 = seg1 + 1, structure.GetCount () do\n"  )
                 fout.write ( "            if seg1 ~= seg2 then\n" )
@@ -563,10 +590,7 @@ def ListCmds ( rxx, detail ):
                 fout.write ( "        end\n" )
                 fout.write ( "    end\n" )
             if args [ "residues1" ] [ "startnam" ] == "residues_ref":
-                segref = "segList_{}".format ( args [ "residues1" ] [ "startval" ] )
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+                segref = doSegPick (  args [ "residues1" ] [ "startval" ] )
                 fout.write ( "    for segidx1 = 1, #{} do\n".format ( segref ) )
                 fout.write ( "        for seg2 = 1, structure.GetCount () do\n" )
                 fout.write ( "            if {} [ segidx1 ] ~= seg2 then\n".format ( segref ) )
@@ -580,17 +604,11 @@ def ListCmds ( rxx, detail ):
     #
         def genByStrideByStride ():
             if args [ "residues1" ] [ "startnam" ] == "single_residue_by_index":
-                start1 = args [ "residues1" ] [ "startval" ]
-                if start1 == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr1 = args [ "residues1" ] [ "stepval" ]
+                start1 = safeStart ( args, "residues1" )
+                incr1 = safeIncr ( args, "residues1" )
                 if args [ "residues2" ] [ "startnam" ] == "single_residue_by_index":
-                    start2 = args [ "residues2" ] [ "startval" ]
-                    if start2 == "-1":
-                        fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                    incr2 = args [ "residues2" ] [ "stepval" ]
-                    if incr2 == "-1":
-                        fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                    start2 = safeStart ( args, "residues2" )
+                    incr2 = safeIncr ( args, "residues2" )
                     fout.write ( "    for seg1 = {}, structure.GetCount (), {} do\n".format ( start1, incr1 ) )
                     fout.write ( "        for seg2 = {}, structure.GetCount (), {} do\n".format ( start2, incr2 ) )
                     fout.write ( "            if seg1 ~= seg2 then\n" )
@@ -599,10 +617,7 @@ def ListCmds ( rxx, detail ):
                     fout.write ( "        end\n" )
                     fout.write ( "    end\n" )
                 if args [ "residues2" ] [ "startnam" ] == "residues_ref":
-                    segref2 = "segList_{}".format ( args [ "residues2" ] [ "startval" ] )
-                    fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                    fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref2 ) )
-                    fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref2 ) )
+                    segref2 = doSegPick (  args [ "residues2" ] [ "startval" ] )
                     fout.write ( "    for seg1 = {}, structure.GetCount (), {} do\n".format ( start1, incr1 ) )
                     fout.write ( "       for segidx2 = 1, #{} do\n".format ( segref2 ) )
                     fout.write ( "            if seg1 ~= {} [ segidx2 ] then\n".format ( segref2 ) )
@@ -611,17 +626,10 @@ def ListCmds ( rxx, detail ):
                     fout.write ( "        end\n")
                     fout.write ( "    end\n" )
             if args [ "residues1" ] [ "startnam" ] == "residues_ref":
-                segref1 = "segList_{}".format ( args [ "residues1" ] [ "startval" ] )
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref1 ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref1 ) )
+                segref1 = doSegPick (  args [ "residues1" ] [ "startval" ] )
                 if args [ "residues2" ] [ "startnam" ] == "single_residue_by_index":
-                    start2 = args [ "residues2" ] [ "startval" ]
-                    if start2 == "-1":
-                        fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                    incr2 = args [ "residues2" ] [ "stepval" ]
-                    if incr2 == "-1":
-                        fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                    start2 = safeStart ( args, "residues2" )
+                    incr2 = safeIncr ( args, "residues2" )
                     fout.write ( "    for segidx1 = 1, #{} do\n".format ( segref1 ) )
                     fout.write ( "        for seg2 = {}, structure.GetCount (), {} do\n".format ( start2, incr2 ) )
                     fout.write ( "            if seg1 ~= seg2 then\n" )
@@ -630,8 +638,7 @@ def ListCmds ( rxx, detail ):
                     fout.write ( "        end\n" )
                     fout.write ( "    end\n" )
                 if args [ "residues2" ] [ "startnam" ] == "residues_ref":
-                    segref2 = "segList_{}".format ( args [ "residues2" ] [ "startval" ] )
-                    fout.write ( "--  TODO: reference to a user pick for segments\n" )
+                    segref2 = doSegPick (  args [ "residues2" ] [ "startval" ] )
                     fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref2 ) )
                     fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref2 ) )
                     fout.write ( "    for segidx1 = 1, #{} do\n".format ( segref1 ) )
@@ -644,17 +651,9 @@ def ListCmds ( rxx, detail ):
             return
         def genByStrideReference ():
             if args [ "residues1" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues1" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues1" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
-                fout.write ( "--  TODO: reference to a user pick\n" )
-                segref2 = "segList_{}".format ( args [ "residues2" ] [ "ref" ] )
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref2 ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref2 ) )
+                start = safeStart ( args, "residues1" )
+                incr = safeIncr ( args, "residues1" )
+                segref2 = doSegPick (  args [ "residues2" ] [ "ref" ] )
                 fout.write ( "    for seg1 = {}, structure.GetCount (), {} do\n".format ( start, incr ) )
                 fout.write ( "        for segidx2 = 1, #{} do\n".format ( segref2 ) )
                 fout.write ( "            if seg1 ~= {} [ segidx2 ] then\n".format ( segref2 ) )
@@ -663,15 +662,8 @@ def ListCmds ( rxx, detail ):
                 fout.write ( "        end\n" )
                 fout.write ( "    end\n" )
             if args [ "residues1" ] [ "startnam" ] == "residues_ref":
-                segref1 = "segList_{}".format ( args [ "residues1" ] [ "startval" ] )
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref1 ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref1 ) )
-                fout.write ( "--  TODO: reference to a user pick\n" )
-                segref2 = "segList_{}".format ( args [ "residues2" ] [ "ref" ] ) 
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref2 ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref2 ) )
+                segref1 = doSegPick (  args [ "residues1" ] [ "startval" ] )
+                segref2 = doSegPick (  args [ "residues2" ] [ "ref" ] )
                 fout.write ( "    for segidx1 = 1, #{} do\n".format ( segref1 ) )
                 fout.write ( "        for segidx2 = 1, #{} do\n".format ( segref2 ) )
                 fout.write ( "            if {} [ segidx1 ] ~= {} [ segidx2 ] then\n".format ( segref1, segref2 ) )
@@ -685,29 +677,19 @@ def ListCmds ( rxx, detail ):
             fout.write ( "--  TODO: select segments for segmentIndex2 argument to band.AddBetweenSegments\n" )
 
             if args [ "residues1" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues1" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues1" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                start = safeStart ( args, "residues1" )
+                incr = safeIncr ( args, "residues1" )
                 fout.write ( "    for seg1 = {}, structure.GetCount (), {} do\n".format ( start, incr ) )
                 fout.write ( "        band.AddBetweenSegments ( seg1, )\n" )
                 fout.write ( "    end\n" )
             if args [ "residues1" ] [ "startnam" ] == "residues_ref":
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                segref = "segList_{}".format ( args [ "residues1" ] [ "startval" ] )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+                segref = doSegPick (  args [ "residues1" ] [ "startval" ] )
                 fout.write ( "    for segidx1 = 1, #{} do\n".format ( segref ) )
                 fout.write ( "        band.AddBetweenSegments ( {} [ segidx1 ], )\n".format ( segref ) )
                 fout.write ( "    end\n" )
             return
         def genReferenceAll ():
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref = "segList_{}".format ( args [ "residues1" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+            segref = doSegPick (  args [ "residues1" ] [ "ref" ] )
             fout.write ( "    for segidx1 = 1, #{} do\n".format ( segref ) )
             fout.write ( "        for seg2 = 1, structure.GetCount () do\n"  )
             fout.write ( "            if {} [ segidx1 ] ~= seg2 then\n".format ( segref ) )
@@ -717,16 +699,10 @@ def ListCmds ( rxx, detail ):
             fout.write ( "    end\n" )
             return
         def genReferenceByStride ():
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref1 = "segList_{}".format ( args [ "residues1" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref1 ) )
+            segref1 = doSegPick (  args [ "residues1" ] [ "ref" ] )
             if args [ "residues2" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues2" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues2" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                start = safeStart ( args, "residues2" )
+                incr = safeIncr ( args, "residues2" )
                 fout.write ( "    for segidx1 = 1, #{} do\n".format ( segref1 ) )
                 fout.write ( "        for seg2 = {}, structure.GetCount (), {} do\n".format ( start, incr ) )
                 fout.write ( "            if {} [ segidx1 ] ~= seg2 then\n".format ( segref1 ) )
@@ -735,10 +711,7 @@ def ListCmds ( rxx, detail ):
                 fout.write ( "        end\n" )
                 fout.write ( "    end\n" )
             if args [ "residues2" ] [ "startnam" ] == "residues_ref":
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                segref2 = "segList_{}".format ( args [ "residues2" ] [ "startval" ] )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref2 ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref2 ) )
+                segref2 = doSegPick (  args [ "residues2" ] [ "ref" ] )
                 fout.write ( "    for segidx1 = 1, #{} do\n".format ( segref1 ) )
                 fout.write ( "        for segidx2 = 1, #{} do\n".format ( segref2 ) )
                 fout.write ( "            if {} [ segidx1 ] ~= {} [ segidx2 ] then\n" )
@@ -748,13 +721,8 @@ def ListCmds ( rxx, detail ):
                 fout.write ( "    end\n" )
             return
         def genReferenceReference ():
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref1 = "segList_{}".format ( args [ "residues1" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref1 ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref1 ) )
-
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref2 = "segList_{}".format ( args [ "residues2" ] [ "ref" ] )
+            segref1 = doSegPick (  args [ "residues1" ] [ "ref" ] )
+            segref2 = doSegPick (  args [ "residues2" ] [ "ref" ] )
             fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref2 ) )
             fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref2 ) )
 
@@ -767,10 +735,7 @@ def ListCmds ( rxx, detail ):
             fout.write ( "    end\n" )
             return
         def genReferenceUndefined ():
-            fout.write ( "--  TODO: reference to a user pick for segments\n" )
-            segref = "segList_{}".format ( args [ "residues1" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+            segref = doSegPick (  args [ "residues1" ] [ "ref" ] )
             fout.write ( "--  TODO: undefined residues2 ingredient\n" )
             fout.write ( "--  TODO: select segments for segmentIndex2 argument to band.AddBetweenSegments\n" )
             fout.write ( "    for segidx1 = 1, #{} do\n".format ( segref ) )
@@ -787,22 +752,15 @@ def ListCmds ( rxx, detail ):
             fout.write ( "--  TODO: undefined residues1 ingredient\n" )
             fout.write ( "--  TODO: select segments for segmentIndex1 argument to band.AddBetweenSegments\n" )
             if args [ "residues2" ] [ "startnam" ] == "single_residue_by_index":
-                start = args [ "residues2" ] [ "startval" ]
-                if start == "-1":
-                    fout.write ( "--  TODO: starting index for \"by stride\" not specified\n" )
-                incr = args [ "residues2" ] [ "stepval" ]
-                if incr == "-1":
-                    fout.write ( "--  TODO: increment for \"by stride\" not specified\n" )
+                start = safeStart ( args, "residues2" )
+                incr = safeIncr ( args, "residues2" )
                 fout.write ( "    for seg2 = {}, structure.GetCount (), {} do\n".format ( start, incr ) )
                 fout.write ( "        if seg1 ~= seg2 then\n" )
                 fout.write ( "            band.AddBetweenSegments ( , seg2 )\n" )
                 fout.write ( "        end\n" )
                 fout.write ( "    end\n" )
             if args [ "residues2" ] [ "startnam" ] == "residues_ref":
-                fout.write ( "--  TODO: reference to a user pick for segments\n" )
-                segref = "segList_{}".format ( args [ "residues2" ] [ "startval" ] )
-                fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-                fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+                segref = doSegPick (  args [ "residues2" ] [ "startval" ] )
                 fout.write ( "    for segidx2 = 1, #{} do\n".format ( segref ) )
                 fout.write ( "        band.AddBetweenSegments ( ,  {} [ segidx2 ] )\n".format ( segref ) ) 
                 fout.write ( "    end\n" )
@@ -810,10 +768,7 @@ def ListCmds ( rxx, detail ):
         def genUndefinedReference ():
             fout.write ( "--  TODO: undefined residues1 ingredient\n" )
             fout.write ( "--  TODO: select segments for segmentIndex1 argument to band.AddBetweenSegments\n" )
-            fout.write ( "--  TODO: reference to a user pick for segment2\n" )
-            segref = "segList_{}".format ( args [ "residues2" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as reference\n".format ( segref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( segref ) )
+            segref = doSegPick (  args [ "residues2" ] [ "ref" ] )
             fout.write ( "    for segidx2 = 1, #{} do\n".format ( segref ) )
             fout.write ( "        band.AddBetweenSegments ( , {} [ segidx2 ] )\n".format ( segref ) )
             fout.write ( "    end\n" )
@@ -855,7 +810,7 @@ def ListCmds ( rxx, detail ):
         ttyp = typ1 + "_" + typ2
         restyps [ ttyp ] ()
         return
-    def genDisable ( args, fout ):
+    def genDisable ( args ):
         def genAll ():
             fout.write ( "    band.DisableAll ()\n" )
             return
@@ -869,10 +824,7 @@ def ListCmds ( rxx, detail ):
             fout.write ( "    end\n" )
             return
         def genReference ():
-            fout.write ( "--  TODO: reference to a user pick for bands\n" )
-            bndref = "bndlist_{}".format ( args [ "bands" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as list of bands\n".format ( bndref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( bndref ) )
+            bndref = doBndPick ( args [ "bands" ] [ "ref" ] )
             fout.write ( "    for bnd = 1, #{} do\n".format ( bndref ) )
             fout.write ( "        band.Disable ( {} [ bnd ] )\n".format ( bndref ) )
             fout.write ( "    end\n" )
@@ -891,7 +843,7 @@ def ListCmds ( rxx, detail ):
         typ = args [ "bands" ] [ "name" ] 
         bndtyps [ typ ] ()
         return
-    def genEnable ( args, fout ):
+    def genEnable ( args ):
         def genAll ():
             fout.write ( "    band.EnableAll ()\n" )
             return
@@ -905,10 +857,7 @@ def ListCmds ( rxx, detail ):
             fout.write ( "    end\n" )
             return
         def genReference ():
-            fout.write ( "--  TODO: reference to a user pick for bands\n" )
-            bndref = "bndlist_{}".format ( args [ "bands" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as list of bands\n".format ( bndref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( bndref ) )
+            bndref = doBndPick ( args [ "bands" ] [ "ref" ] )
             fout.write ( "    for bnd = 1, #{} do\n".format ( bndref ) )
             fout.write ( "        band.Enable ( {} [ bnd ] )\n".format ( bndref ) )
             fout.write ( "    end\n" )
@@ -927,7 +876,7 @@ def ListCmds ( rxx, detail ):
         typ = args [ "bands" ] [ "name" ] 
         bndtyps [ typ ] ()
         return
-    def genRemove ( args, fout ):
+    def genRemove ( args ):
         def genAll ():
             fout.write ( "    band.DeleteAll ()\n" )
             return
@@ -941,10 +890,7 @@ def ListCmds ( rxx, detail ):
             fout.write ( "    end\n" )
             return
         def genReference ():
-            fout.write ( "--  TODO: reference to a user pick for bands\n" )
-            bndref = "bndlist_{}".format ( args [ "bands" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as list of bands\n".format ( bndref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( bndref ) )
+            bndref = doBndPick ( args [ "bands" ] [ "ref" ] )
             fout.write ( "    for bnd = 1, #{} do\n".format ( bndref ) )
             fout.write ( "        band.Delete ( {} [ bnd ] )\n".format ( bndref ) )
             fout.write ( "    end\n" )
@@ -963,7 +909,7 @@ def ListCmds ( rxx, detail ):
         typ = args [ "bands" ] [ "name" ] 
         bndtyps [ typ ] ()
         return
-    def genSetStrength ( args, fout ):
+    def genSetStrength ( args ):
         def genAll ():
             bndstr = args [ "strength" ] [ "val" ]
             if bndstr == "-1":
@@ -988,10 +934,7 @@ def ListCmds ( rxx, detail ):
             bndstr = args [ "strength" ] [ "val" ]
             if bndstr == "-1":
                 fout.write ( "--  TODO: missing strength ingredient\n" )
-            fout.write ( "--  TODO: reference to a user pick for bands\n" )
-            bndref = "bndlist_{}".format ( args [ "bands" ] [ "ref" ] )
-            fout.write ( "--  TODO: generating for loop using \"{}\" as list of bands\n".format ( bndref ) )
-            fout.write ( "--  TODO: for loop syntax is valid, but \"{}\" is undefined\n".format ( bndref ) )
+            bndref = doBndPick ( args [ "bands" ] [ "ref" ] )
             fout.write ( "    for bnd = 1, #{} do\n".format ( bndref ) )
             fout.write ( "        band.SetStrength ( {} [ bnd ], {} )\n".format ( bndref, bndstr ) )
             fout.write ( "    end\n" )
@@ -1013,40 +956,42 @@ def ListCmds ( rxx, detail ):
         typ = args [ "bands" ] [ "name" ] 
         bndtyps [ typ ] ()        
         return
-    def genSetCI ( args, fout ):
+    def genSetCI ( args ):
         val = args [ "importance" ] [ "val" ]
         if val == "-1":
             fout.write ( "--  TODO: missing importance ingredient\n" )
         fout.write ( "    behavior.SetClashingImportance ( {} )\n".format ( val ) )
         return
-    def genResetPuzzle ( args, fout ):
+    def genResetPuzzle ( args ):
         fout.write ( "    puzzle.StartOver ()\n" )
         return
-    def genRestoreAbs ( args, fout ):
+    def genRestoreAbs ( args ):
         fout.write ( "    absolutebest.Restore ()\n" )
         return
-    def genSetRecent ( args, fout ):
+    def genSetRecent ( args ):
         fout.write ( "    recentbest.Save ()\n" )
         return
-    def genRestoreRecent ( args, fout ):
+    def genRestoreRecent ( args ):
         fout.write ( "    recentbest.Restore ()\n" )
         return
-    def genQuicksave ( args, fout ):
+    def genQuicksave ( args ):
         val = args [ "slot" ] [ "val" ]
         if val == "-1":
             fout.write ( "--  TODO: missing slot ingredient\n" )
         fout.write ( "    save.Quicksave ( {} )\n".format ( val ) )
         return
-    def genQuickload ( args, fout ):
+    def genQuickload ( args ):
         val = args [ "slot" ] [ "val" ]
         if val == "-1":
             fout.write ( "--  TODO: missing slot ingredient\n" )
         fout.write ( "    save.Quickload ( {} )\n".format ( val ) )
         return
-    def genComment ( args, fout ):
+    def genComment ( args ):
         val = args [ "comment" ] [ "val" ]
+        lines = val.splitlines ()
         fout.write ( "--\n" )
-        fout.write ( "--  {}\n".format ( val ) )
+        for line in lines:
+            fout.write ( "--  {}\n".format ( line ) )
         fout.write ( "--\n" )
         return
 #
@@ -1218,9 +1163,10 @@ def ListCmds ( rxx, detail ):
         s = str(s).strip().replace(' ', '_')
         return re.sub(r'(?u)[^-\w.]', '', s)
     rxxfile = get_valid_filename ( rxx [ "name" ] ) + ".lua" 
-    with open ( rxxfile, "w" ) as fout:
+    with open ( os.path.join ( outdir, rxxfile ), "w" ) as fout:
     #
     #   print the recipe attributes as a Lua block comment
+    #   (this list of attributes is specific to GUI recipes)
     #
         rxattrs = [
              "name",
@@ -1241,6 +1187,11 @@ def ListCmds ( rxx, detail ):
         for attr in rxattrs:
             fout.write ( "    {} = {}\n".format ( attr, rxx [ attr ] ) )
         fout.write ( "\n]]--\n" )
+    #
+    #   track user picks for segments and bands
+    #
+        segpick = []
+        bndpick = []
     #
     #   print each command 
     #
@@ -1274,11 +1225,46 @@ def ListCmds ( rxx, detail ):
         #   generate the Lua for the command
         #
             cmdgen = rxcmds [ cmdcmd ]
-            cmdgen [ 0 ] ( argl, fout )
+            cmdgen [ 0 ] ( argl )
 
     return
-def main():
-    ReVersion = "MacroScanner 1.0" 
+def checkAttrs ( rxx ):
+#
+#   check for the presence of each 
+#   of the attributes, add a default
+#   value if missing
+#
+#   this allows processing the old
+#   GUI example recipes, which 
+#   were missing certain attributes
+#
+#   this list includes the attributes
+#   common to GUI and Lua recipes
+#
+    attrvals = {
+         "name": "unknown",
+         "desc": "unknown",
+         "size": "0",
+         "type": "gui",
+         "folder_name": "unknown",  
+         "hidden": "0",
+         "mid": "0",
+         "mrid": "0",
+         "parent": "0",
+         "parent_mrid": "0",
+         "player_id": "0",
+         "share_scope": "0",
+         "uses": "0",
+           }
+    for attr in attrvals:
+        try:
+            safety = rxx [ attr ]
+        except:
+            rxx [ attr ] = attrvals [ attr ]
+            pass
+    return
+def main ():
+    ReVersion = "MacroScanner 1.1" 
 
     prog = 'python MacroScanner.py'
     description = ('Scan Foldit cookbook all.macro file for '
@@ -1294,14 +1280,31 @@ def main():
                         default=sys.stdout)
     parser.add_argument('--detail', action='store_true', default=False,
                         help='include details of each GUI command in Lua output')
+    parser.add_argument('--LuaV1', action='store_true', default=False,
+                        help='include recipes written using V1 of the Foldit Lua interface')
+    parser.add_argument('--LuaV2', action='store_true', default=False,
+                        help='include recipes written using V2 of the Foldit Lua interface')
+    parser.add_argument('--noGUI', action='store_true', default=False,
+                        help='don\'t include GUI recipes')
+    parser.add_argument('--outdir', default=".",
+                        help='output directory')
+
     options = parser.parse_args()
 
     recipes = 0
     guirecipes = 0
+    guiskips = 0
     luarecipes = 0
+    v1skips = 0
+    v2skips = 0
     jsonerrors = 0
 
     linecnt = 0
+
+    outdir = options.outdir
+    if not os.path.exists(outdir):
+        os.makedirs(outdir)
+
 #
 #   process the outer level, removing version and verify
 #
@@ -1309,6 +1312,8 @@ def main():
 #
     with options.infile as fp, options.outfile as fo:
         try:
+            singlefmt = False
+            singledict = {}
             fo.write ( ReVersion )
             fo.write ( "\n" )
             for line in fp:
@@ -1336,20 +1341,54 @@ def main():
                     #
                         linex = re.sub ( r"(\\+)([#,])", r"\2", line )
                         rx = json.loads ( linex )
-                        for kk, vv in rx.items ():
-                        #
-                        #   next level down has the content of each recipe
-                        #   TODO: might want to make this a "try"
-                        #
-                            rxx = JSONize ( vv )
-                            fo.write ( "=========================================================================\n" )
-                            fo.write ( "recipe = \"{}\", type = \"{}\"\n".format ( rxx [ "name" ], rxx [ "type" ] ) )
-                            fo.write ( "description = \"{}\"\n".format ( rxx [ "desc" ] ) )
-                            if rxx [ "type" ] == "gui":
-                                guirecipes = guirecipes + 1
-                                ListCmds ( rxx, options.detail )
-                            if rxx [ "type" ] == "script":
-                                luarecipes = luarecipes + 1
+ 
+                    #
+                    #   detect single.macro format in typical brute-force style
+                    #
+                        if not singlefmt:
+                            for kk, vv in rx.items ():
+                                if kk == "action-0":
+                                    singlefmt = True
+                                    fo.write ( "single.macro format\n")
+                                    break
+                    #
+                    #   in single.macro format, accumulate each line into a dictionary
+                    #
+                        if singlefmt:
+                            singledict.update ( rx )
+                    #
+                    #   in normal mode, the entire recipe is contained in the line we just read
+                    #
+                        else:
+                            for kk, vv in rx.items ():
+                            #
+                            #   next level down has the content of each recipe
+                            #
+                                rxx = JSONize ( vv )
+                                checkAttrs ( rxx )
+                                fo.write ( "=========================================================================\n" )
+
+                                fo.write ( "recipe = \"{}\", type = \"{}\"\n".format ( rxx [ "name" ], rxx [ "type"] ) )
+                                fo.write ( "description = \"{}\"\n".format ( rxx [ "desc" ] ) )
+                                if rxx [ "type" ] == "gui":
+                                    guirecipes = guirecipes + 1
+                                    if not options.noGUI:
+                                        ListCmds ( rxx, options.detail, outdir )
+                                    else:
+                                        print ( "recipe skipped" )
+                                        guiskips = guiskips + 1
+                                if rxx [ "type" ] == "script":
+                                    luarecipes = luarecipes + 1
+                                    sver = rxx [ "script_version" ]
+                                    if options.LuaV1 and sver == "1" or options.LuaV2 and sver == "2":
+                                        ListLua ( rxx, outdir )
+                                    else:
+                                        print ( "recipe skipped" )
+                                        if sver == "1":
+                                            v1skips = v1skips + 1
+                                        if sver == "2":
+                                            v2skips = v2skips + 1
+
                     except json.JSONDecodeError as erred:
                         fo.write ( "JSON decode error: {}\n".format ( erred ) )
                         fo.write ( "error position {}\n".format ( erred.pos ) )
@@ -1361,6 +1400,33 @@ def main():
                         fo.write ( "error context = \"{}\" [ {}:{} ]\n".format ( erred.doc [ dstart: dend ], dstart, dend ) )
                         jsonerrors = jsonerrors + 1
                         pass
+        #
+        #   at the end, for single.macro format, dump the recipe
+        #
+            if singlefmt:
+                checkAttrs ( singledict )
+                fo.write ( "=========================================================================\n" )
+
+                fo.write ( "recipe = \"{}\", type = \"{}\"\n".format ( singledict [ "name" ], singledict [ "type"] ) )
+                fo.write ( "description = \"{}\"\n".format ( singledict [ "desc" ] ) )
+                if singledict [ "type" ] == "gui":
+                    guirecipes = guirecipes + 1
+                    if not options.noGUI:
+                        ListCmds ( singledict, options.detail, outdir )
+                    else:
+                        print ( "recipe skipped" )
+                        guiskips = guiskips + 1
+                if singledict [ "type" ] == "script":
+                    luarecipes = luarecipes + 1
+                    sver = singledict [ "script_version" ]
+                    if options.LuaV1 and sver == "1" or options.LuaV2 and sver == "2":
+                        ListLua ( singledict, outdir )
+                    else:
+                        print ( "recipe skipped" )
+                        if sver == "1":
+                            v1skips = v1skips + 1
+                        if sver == "2":
+                            v2skips = v2skips + 1
 
         except UnicodeDecodeError as erred:
             fo.write ( erred )
@@ -1371,6 +1437,14 @@ def main():
         fo.write ( ReVersion + " - complete\n" )
         fo.write ( "recipes read = {}\n".format ( recipes ) )
         fo.write ( "GUI recipes = {}\n".format ( guirecipes ) )
+        if guiskips > 0:
+            fo.write ( "GUI recipes skipped = {}\n".format ( guiskips ) )
         fo.write ( "Lua recipes = {}\n".format ( luarecipes ) )
+        if v1skips > 0:
+            fo.write ( "Lua V1 recipes skipped = {}\n".format ( v1skips ) )
+        if v2skips > 0:
+            fo.write ( "Lua V2 recipes skipped = {}\n".format ( v2skips ) )
         fo.write ( "JSON errors = {}\n".format ( jsonerrors ) )
-main()
+
+if __name__ == "__main__":
+   main ()
