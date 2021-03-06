@@ -46,7 +46,8 @@ optional arguments:
   --noGUI          don't include GUI recipes
   --outdir OUTDIR  output directory for the Lua files, created as needed 
 
-MacroScanner was written and tested using Python 3.7.3, but it may be compatible with older versions of Python 3. It doesn't work with Python 1 nor 2. Lua V1 recipes will crash it after converting some of the GUI recipes (but not necessarily the ones alphabetically preceding the Lua V1 recipes).
+MacroScanner was written and tested using Python 3.7.3, but it may be compatible with older versions of Python 3. It doesn't work with Python 1 nor 2. 
+Still, on Python 3, it may crash (possibly from dividers) after converting some of the GUI recipes (but not necessarily the ones alphabetically first).
 
 Some features of GUI recipes may result in Lua recipes which won't run without modification.
 
